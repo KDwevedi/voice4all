@@ -36,7 +36,13 @@ model = FastLanguageModel.get_peft_model(
 try:
     # Load WebDataset format from HuggingFace
     # The dataset has TAR shards in data/train/, data/test/, data/validation/
-    dataset = load_dataset("webdataset", data_dir="Chakshu/gujarati-tts/resolve/main/data/train", split="train")
+    # For WebDataset format, we need to use the webdataset loader with the HF dataset path
+    # The data_dir should point to the directory containing the TAR files
+    dataset = load_dataset(
+        "webdataset",
+        data_dir="hf://datasets/Chakshu/gujarati-tts/data/train",
+        split="train"
+    )
     # Get sample rate from first audio file (WebDataset format: audio bytes in "wav" key)
     first_sample = dataset[0]
     audio_bytes = first_sample["wav"]
