@@ -5,7 +5,7 @@ Includes speaker metadata and correct file extensions
 """
 
 import json
-import os
+import io
 import tempfile
 import tarfile
 import subprocess
@@ -112,10 +112,7 @@ def process_split(url: str, split_name: str, repo_id: str, api: HfApi):
         # Upload remaining files
         if shard_files:
             shard_num += 1
-            create_and_upload_shard(
-                shard_files, shard_num, split_name,
-                temp_path, repo_id, api, total_files
-            )
+            create_and_upload_shard(shard_files, shard_num, split_name, temp_path, repo_id, api, total_files)
 
     print(f"\n✓ Completed {split_name}: {total_files} files in {shard_num} shards")
     return total_files, shard_num
@@ -136,13 +133,13 @@ def create_and_upload_shard(shard_files, shard_num, split_name, temp_path, repo_
             # Add audio file - FIXED: Use .wav extension for WAV data!
             audio_info = tarfile.TarInfo(name=f"{prefix}.wav")
             audio_info.size = len(item['audio'])
-            tar.addfile(audio_info, fileobj=__import__('io').BytesIO(item['audio']))
+            tar.addfile(audio_info, fileobj=io.BytesIO(item['audio']))
 
             # Add metadata JSON
             metadata_bytes = json.dumps(item['metadata'], ensure_ascii=False).encode('utf-8')
             metadata_info = tarfile.TarInfo(name=f"{prefix}.json")
             metadata_info.size = len(metadata_bytes)
-            tar.addfile(metadata_info, fileobj=__import__('io').BytesIO(metadata_bytes))
+            tar.addfile(metadata_info, fileobj=io.BytesIO(metadata_bytes))
 
     # Upload TAR shard
     tar_size_mb = tar_path.stat().st_size / 1024 / 1024
