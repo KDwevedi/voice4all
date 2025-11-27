@@ -9,6 +9,7 @@ import io
 import soundfile as sf
 from snac import SNAC
 from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
+from huggingface_hub import HfApi
 
 locale.getpreferredencoding = lambda: "UTF-8"
 
@@ -35,14 +36,35 @@ model = FastLanguageModel.get_peft_model(
 
 try:
     # Load WebDataset format from HuggingFace
-    # The dataset has TAR shards in data/train/, data/test/, data/validation/
-    # For WebDataset format, we need to use the webdataset loader with the HF dataset path
-    # The data_dir should point to the directory containing the TAR files
+    # First, list all TAR files in the train directory
+    api = HfApi()
+    repo_id = "Chakshu/gujarati-tts"
+    split = "train"
+    
+    print(f"Listing TAR files from {repo_id}/data/{split}...")
+    repo_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    
+    # Filter for train TAR files
+    tar_files = [f for f in repo_files if f.startswith(f"data/{split}/") and f.endswith(".tar")]
+    tar_files.sort()
+    
+    if not tar_files:
+        raise ValueError(f"No TAR files found in data/{split}/")
+    
+    print(f"Found {len(tar_files)} TAR shard(s)")
+    
+    # Construct URLs for each TAR file
+    base_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
+    tar_urls = [base_url + tar_file for tar_file in tar_files]
+    
+    # Load WebDataset using the URLs
     dataset = load_dataset(
         "webdataset",
-        data_dir="hf://datasets/Chakshu/gujarati-tts/data/train",
-        split="train"
+        data_files={"train": tar_urls},
+        split="train",
+        streaming=False
     )
+    
     # Get sample rate from first audio file (WebDataset format: audio bytes in "wav" key)
     first_sample = dataset[0]
     audio_bytes = first_sample["wav"]
