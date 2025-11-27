@@ -5,7 +5,8 @@ import torch
 from datasets import load_dataset
 import locale
 import torchaudio.transforms as T
-import os
+import io
+import soundfile as sf
 from snac import SNAC
 from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
 
@@ -32,8 +33,17 @@ model = FastLanguageModel.get_peft_model(
     loftq_config=None,
 )
 
-dataset = load_dataset("MrDragonFox/Elise", split="train")
-ds_sample_rate = dataset[0]["audio"]["sampling_rate"]
+try:
+    dataset = load_dataset("webdataset", data_dir="Chakshu/gujarati-tts/resolve/main/data", split="train")
+    # Get sample rate from first audio file (WebDataset format: audio bytes in "wav" key)
+    first_sample = dataset[0]
+    audio_bytes = first_sample["wav"]
+    audio_io = io.BytesIO(audio_bytes)
+    audio_data, ds_sample_rate = sf.read(audio_io)
+    print(f"Loaded dataset with sample rate: {ds_sample_rate} Hz")
+except Exception as e:
+    print(f"Error loading dataset: {e}")
+    raise
 
 snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
 snac_model = snac_model.to("cuda")
@@ -64,16 +74,19 @@ def add_codes(example):
     codes_list = None
 
     try:
-        answer_audio = example.get("audio")
-        if answer_audio and "array" in answer_audio:
-            audio_array = answer_audio["array"]
+        # WebDataset format: audio is in "wav" key as bytes
+        audio_bytes = example.get("wav")
+        if audio_bytes:
+            # Decode WAV bytes to numpy array
+            audio_io = io.BytesIO(audio_bytes)
+            audio_array, _ = sf.read(audio_io)
             codes_list = tokenise_audio(audio_array)
     except Exception as e:
         print(f"Skipping row due to error: {e}")
     example["codes_list"] = codes_list
     return example
 
-dataset = dataset.map(add_codes, remove_columns=["audio"])
+dataset = dataset.map(add_codes, remove_columns=["wav"])
 
 tokeniser_length = 128256
 start_of_text = 128000
@@ -113,7 +126,12 @@ def remove_duplicate_frames(example):
 dataset = dataset.map(remove_duplicate_frames)
 
 def create_input_ids(example):
-    text_prompt = f"{example['source']}: {example['text']}" if "source" in example else example["text"]
+    # WebDataset format: metadata is in "json" key
+    metadata = example.get("json", {})
+    text = metadata.get("text", "") if isinstance(metadata, dict) else ""
+    source = metadata.get("speaker_id", "") if isinstance(metadata, dict) else ""
+    
+    text_prompt = f"{source}: {text}" if source else text
     text_ids = tokenizer.encode(text_prompt, add_special_tokens=True)
     text_ids.append(end_of_text)
 
@@ -133,7 +151,7 @@ def create_input_ids(example):
     example["attention_mask"] = [1] * len(input_ids)
     return example
 
-dataset = dataset.map(create_input_ids, remove_columns=["text", "codes_list"])
+dataset = dataset.map(create_input_ids, remove_columns=["json", "codes_list"])
 columns_to_keep = ["input_ids", "labels", "attention_mask"]
 columns_to_remove = [col for col in dataset.column_names if col not in columns_to_keep]
 dataset = dataset.remove_columns(columns_to_remove)
