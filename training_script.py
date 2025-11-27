@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-
+​
 from unsloth import FastLanguageModel
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Features, Value, Audio
 import locale
 import torchaudio.transforms as T
 import io
@@ -10,16 +10,16 @@ import soundfile as sf
 from snac import SNAC
 from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from huggingface_hub import HfApi
-
+​
 locale.getpreferredencoding = lambda: "UTF-8"
-
+​
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name="unsloth/orpheus-3b-0.1-ft",
     max_seq_length=2048,
     dtype=None,
     load_in_4bit=False,
 )
-
+​
 model = FastLanguageModel.get_peft_model(
     model,
     r=64,
@@ -33,7 +33,7 @@ model = FastLanguageModel.get_peft_model(
     use_rslora=False,
     loftq_config=None,
 )
-
+​
 try:
     # Load WebDataset format from HuggingFace
     # First, list all TAR files in the train directory
@@ -57,12 +57,22 @@ try:
     base_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
     tar_urls = [base_url + tar_file for tar_file in tar_files]
     
+    # Define features explicitly to avoid auto-inference issues
+    features = Features({
+        "wav": Value("binary"),
+        "json": {
+            "text": Value("string"),
+            "speaker_id": Value("string"),
+        }
+    })
+    
     # Load WebDataset using the URLs
     dataset = load_dataset(
         "webdataset",
         data_files={"train": tar_urls},
         split="train",
-        streaming=False
+        streaming=False,
+        features=features
     )
     
     # Get sample rate from first audio file (WebDataset format: audio bytes in "wav" key)
@@ -74,20 +84,26 @@ try:
 except Exception as e:
     print(f"Error loading dataset: {e}")
     raise
-
+​
 snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
 snac_model = snac_model.to("cuda")
-
+​
 def tokenise_audio(waveform):
-    waveform = torch.from_numpy(waveform).unsqueeze(0)
+    waveform = torch.from_numpy(waveform)
+    
+    # Convert stereo to mono if needed
+    if waveform.ndim == 2:  # Stereo: [samples, channels]
+        waveform = waveform.mean(dim=1)  # Average channels -> [samples]
+    
+    waveform = waveform.unsqueeze(0)  # [1, samples]
     waveform = waveform.to(dtype=torch.float32)
     resample_transform = T.Resample(orig_freq=ds_sample_rate, new_freq=24000)
     waveform = resample_transform(waveform)
     waveform = waveform.unsqueeze(0).to("cuda")
-
+​
     with torch.inference_mode():
         codes = snac_model.encode(waveform)
-
+​
     all_codes = []
     for i in range(codes[0].shape[1]):
         all_codes.append(codes[0][0][i].item()+128266)
@@ -97,12 +113,12 @@ def tokenise_audio(waveform):
         all_codes.append(codes[1][0][(2*i)+1].item()+128266+(4*4096))
         all_codes.append(codes[2][0][(4*i)+2].item()+128266+(5*4096))
         all_codes.append(codes[2][0][(4*i)+3].item()+128266+(6*4096))
-
+​
     return all_codes
-
+​
 def add_codes(example):
     codes_list = None
-
+​
     try:
         # WebDataset format: audio is in "wav" key as bytes
         audio_bytes = example.get("wav")
@@ -115,9 +131,9 @@ def add_codes(example):
         print(f"Skipping row due to error: {e}")
     example["codes_list"] = codes_list
     return example
-
+​
 dataset = dataset.map(add_codes, remove_columns=["wav"])
-
+​
 tokeniser_length = 128256
 start_of_text = 128000
 end_of_text = 128009
@@ -129,32 +145,32 @@ start_of_ai = tokeniser_length + 5
 end_of_ai = tokeniser_length + 6
 pad_token = tokeniser_length + 7
 audio_tokens_start = tokeniser_length + 10
-
+​
 dataset = dataset.filter(lambda x: x["codes_list"] is not None)
 dataset = dataset.filter(lambda x: len(x["codes_list"]) > 0)
-
+​
 def remove_duplicate_frames(example):
     vals = example["codes_list"]
     if len(vals) % 7 != 0:
         raise ValueError("Input list length must be divisible by 7")
-
+​
     result = vals[:7]
     removed_frames = 0
-
+​
     for i in range(7, len(vals), 7):
         current_first = vals[i]
         previous_first = result[-7]
-
+​
         if current_first != previous_first:
             result.extend(vals[i:i+7])
         else:
             removed_frames += 1
-
+​
     example["codes_list"] = result
     return example
-
+​
 dataset = dataset.map(remove_duplicate_frames)
-
+​
 def create_input_ids(example):
     # WebDataset format: metadata is in "json" key
     metadata = example.get("json", {})
@@ -164,7 +180,7 @@ def create_input_ids(example):
     text_prompt = f"{source}: {text}" if source else text
     text_ids = tokenizer.encode(text_prompt, add_special_tokens=True)
     text_ids.append(end_of_text)
-
+​
     example["text_tokens"] = text_ids
     input_ids = (
         [start_of_human]
@@ -180,12 +196,17 @@ def create_input_ids(example):
     example["labels"] = input_ids
     example["attention_mask"] = [1] * len(input_ids)
     return example
-
+​
 dataset = dataset.map(create_input_ids, remove_columns=["json", "codes_list"])
 columns_to_keep = ["input_ids", "labels", "attention_mask"]
 columns_to_remove = [col for col in dataset.column_names if col not in columns_to_keep]
 dataset = dataset.remove_columns(columns_to_remove)
-
+​
+# Filter out sequences that exceed model's max sequence length
+MAX_LENGTH = 2048
+dataset = dataset.filter(lambda x: len(x["input_ids"]) <= MAX_LENGTH)
+print(f"Filtered dataset size: {len(dataset)} samples (removed samples > {MAX_LENGTH} tokens)")
+​
 trainer = Trainer(
     model=model,
     train_dataset=dataset,
@@ -202,17 +223,22 @@ trainer = Trainer(
         seed=3407,
         output_dir="outputs",
         report_to="none",
+        # Checkpoint configuration
+        save_strategy="steps",           # Save checkpoint every N steps
+        save_steps=10,                    # Save every 10 steps
+        save_total_limit=3,               # Keep only the last 3 checkpoints
+        load_best_model_at_end=False,    # Set to True if you want to load best model at end
     ),
 )
-
+​
 gpu_stats = torch.cuda.get_device_properties(0)
 start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
 print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
 print(f"{start_gpu_memory} GB of memory reserved.")
-
+​
 trainer_stats = trainer.train()
-
+​
 used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
 used_percentage = round(used_memory / max_memory * 100, 3)
@@ -223,31 +249,31 @@ print(f"Peak reserved memory = {used_memory} GB.")
 print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
 print(f"Peak reserved memory % of max memory = {used_percentage} %.")
 print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
-
+​
 prompts = [
     "Hey there my name is Elise, <giggles> and I'm a speech generation model that can sound like a person.",
 ]
-
+​
 chosen_voice = None
-
+​
 FastLanguageModel.for_inference(model)
 snac_model.to("cpu")
-
+​
 prompts_ = [(f"{chosen_voice}: " + p) if chosen_voice else p for p in prompts]
-
+​
 all_input_ids = []
 for prompt in prompts_:
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
     all_input_ids.append(input_ids)
-
+​
 start_token = torch.tensor([[128259]], dtype=torch.int64)
 end_tokens = torch.tensor([[128009, 128260]], dtype=torch.int64)
-
+​
 all_modified_input_ids = []
 for input_ids in all_input_ids:
     modified_input_ids = torch.cat([start_token, input_ids, end_tokens], dim=1)
     all_modified_input_ids.append(modified_input_ids)
-
+​
 all_padded_tensors = []
 all_attention_masks = []
 max_length = max([modified_input_ids.shape[1] for modified_input_ids in all_modified_input_ids])
@@ -257,10 +283,10 @@ for modified_input_ids in all_modified_input_ids:
     attention_mask = torch.cat([torch.zeros((1, padding), dtype=torch.int64), torch.ones((1, modified_input_ids.shape[1]), dtype=torch.int64)], dim=1)
     all_padded_tensors.append(padded_tensor)
     all_attention_masks.append(attention_mask)
-
+​
 all_padded_tensors = torch.cat(all_padded_tensors, dim=0)
 all_attention_masks = torch.cat(all_attention_masks, dim=0)
-
+​
 input_ids = all_padded_tensors.to("cuda")
 attention_mask = all_attention_masks.to("cuda")
 generated_ids = model.generate(
@@ -275,25 +301,25 @@ generated_ids = model.generate(
     eos_token_id=128258,
     use_cache=True
 )
-
+​
 token_to_find = 128257
 token_to_remove = 128258
-
+​
 token_indices = (generated_ids == token_to_find).nonzero(as_tuple=True)
-
+​
 if len(token_indices[1]) > 0:
     last_occurrence_idx = token_indices[1][-1].item()
     cropped_tensor = generated_ids[:, last_occurrence_idx+1:]
 else:
     cropped_tensor = generated_ids
-
+​
 mask = cropped_tensor != token_to_remove
-
+​
 processed_rows = []
 for row in cropped_tensor:
     masked_row = row[row != token_to_remove]
     processed_rows.append(masked_row)
-
+​
 code_lists = []
 for row in processed_rows:
     row_length = row.size(0)
@@ -301,7 +327,7 @@ for row in processed_rows:
     trimmed_row = row[:new_length]
     trimmed_row = [t - 128266 for t in trimmed_row]
     code_lists.append(trimmed_row)
-
+​
 def redistribute_codes(code_list):
     layer_1 = []
     layer_2 = []
@@ -317,15 +343,15 @@ def redistribute_codes(code_list):
     codes = [torch.tensor(layer_1).unsqueeze(0),
              torch.tensor(layer_2).unsqueeze(0),
              torch.tensor(layer_3).unsqueeze(0)]
-
+​
     audio_hat = snac_model.decode(codes)
     return audio_hat
-
+​
 my_samples = []
 for code_list in code_lists:
     samples = redistribute_codes(code_list)
     my_samples.append(samples)
-
+​
 if len(prompts) != len(my_samples):
     raise Exception("Number of prompts and samples do not match")
 else:
@@ -334,9 +360,9 @@ else:
         samples = my_samples[i]
         audio_np = samples.detach().squeeze().to("cpu").numpy()
         print(f"[Saved audio tensor of shape {audio_np.shape}]")
-
+​
 del my_samples, samples
-
+​
 print("\nSaving LoRA model into ./lora_model ...")
 model.save_pretrained("lora_model")
 tokenizer.save_pretrained("lora_model")
